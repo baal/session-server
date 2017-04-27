@@ -379,5 +379,4 @@ fn main() {
 			thread::spawn(move || handler(&session_manager, stream));
 		}
 	}
-	println!("END");
 }
