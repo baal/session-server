@@ -54,15 +54,66 @@ fn bytes_to_string(bytes: &[u8]) -> String {
 	ret
 }
 
+struct User {
+	name: String,
+	password: String,
+	created: i64,
+	updated: i64,
+	deleted: i64,
+	last_loggedin: i64,
+}
+
+impl User {
+	fn new(name: &str, password: &str) -> User {
+		User {
+			name: name.to_string(),
+			password: password.to_string(),
+			created: time::get_time().sec,
+			updated: 0,
+			deleted: 0,
+			last_loggedin: 0,
+		}
+	}
+	fn parse(name: &str, rest: &str) -> User {
+		let mut parts = rest.split_whitespace();
+		User {
+			name: name.to_string(),
+			password: parts.next().map_or(String::new(), |s| String::from(s)),
+			created: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+			updated: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+			deleted: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+			last_loggedin: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+		}
+	}
+	fn to_string(&self) -> String {
+		let mut buf = String::new();
+		buf.push_str(self.name.as_str());
+		buf.push('\x20');
+		buf.push_str(self.password.as_str());
+		buf.push('\x20');
+		buf.push_str(self.created.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.updated.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.deleted.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.last_loggedin.to_string().as_str());
+		buf
+	}
+	fn is_deleted(&self) -> bool {
+		self.deleted != 0
+	}
+}
+
 struct Session {
-	user: String,
+	name: String,
 	last_accessed: i64,
 }
 
 impl Session {
-	fn new(user: &str) -> Session {
+	fn new(name: &str) -> Session {
 		Session {
-			user: user.to_string(),
+			name: name.to_string(),
 			last_accessed: time::get_time().sec,
 		}
 	}
@@ -74,9 +125,8 @@ impl Session {
 struct SessionManager {
 	seqno: u8,
 	sessions: HashMap<String, Session>,
-	created_users: HashMap<String, String>,
-	updated_users: HashMap<String, String>,
-	deleted_users: HashMap<String, String>,
+	created_users: HashMap<String, User>,
+	updated_users: HashMap<String, User>,
 }
 
 impl SessionManager {
@@ -86,7 +136,6 @@ impl SessionManager {
 			sessions: HashMap::new(),
 			created_users: HashMap::new(),
 			updated_users: HashMap::new(),
-			deleted_users: HashMap::new(),
 		}
 	}
 	fn clean(&mut self) {
@@ -104,21 +153,33 @@ impl SessionManager {
 		bytes[15] = self.seqno;
 		bytes_to_string(&bytes)
 	}
-	fn login(&mut self, user: &str, pass: &str) -> Result<String, &'static str> {
-		let result = ! self.deleted_users.contains_key(user) &&
-		match self.created_users.get(user) {
-			Some(pw) => pw == pass,
-			None => match self.updated_users.get(user) {
-				Some(pw) => pw == pass,
-				None => match cdb::cdb_get(FILE_USERS_CDB, user) {
-					Ok(pw) => pw == pass,
-					Err(_) => false,
-				},
-			},
-		};
+	fn login(&mut self, name: &str, pass: &str) -> Result<String, &'static str> {
+		let mut result = false;
+		if self.created_users.contains_key(name) {
+			if let Some(user) = self.created_users.get_mut(name) {
+				if user.password == pass {
+					user.last_loggedin = time::get_time().sec;
+					result = true;
+				}
+			}
+		} else if self.updated_users.contains_key(name) {
+			if let Some(user) = self.updated_users.get_mut(name) {
+				if ! user.is_deleted() && user.password == pass {
+					user.last_loggedin = time::get_time().sec;
+					result = true;
+				}
+			}
+		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+			let mut user = User::parse(name, s.as_str());
+			if ! user.is_deleted() && user.password == pass {
+				user.last_loggedin = time::get_time().sec;
+				self.updated_users.insert(name.to_string(), user);
+				result = true;
+			}
+		}
 		if result {
 			let session_id = self.create_session_id();
-			self.sessions.insert(session_id.clone(), Session::new(user));
+			self.sessions.insert(session_id.clone(), Session::new(name));
 			Ok(session_id)
 		} else {
 			Err("Login failed.")
@@ -136,54 +197,66 @@ impl SessionManager {
 	fn logout(&mut self, session_id: &str) -> Result<Session, &'static str> {
 		self.sessions.remove(session_id).ok_or("Session not found.")
 	}
-	fn create_user(&mut self, user: &str, pass: &str) -> Result<String, &'static str> {
-		let result = if self.deleted_users.contains_key(user) {
-			! self.created_users.contains_key(user)
-		} else {
-			! self.created_users.contains_key(user) &&
-			! self.updated_users.contains_key(user) &&
-			! cdb::cdb_get(FILE_USERS_CDB, user).is_ok()
-		};
-		if result {
-			self.created_users.insert(user.to_string(), pass.to_string());
+	fn create_user(&mut self, name: &str, pass: &str) -> Result<String, &'static str> {
+		if
+			! self.created_users.contains_key(name) &&
+			! self.updated_users.contains_key(name) &&
+			! cdb::cdb_get(FILE_USERS_CDB, name).is_ok()
+		{
+			self.created_users.insert(name.to_string(), User::new(name, pass));
 			let session_id = self.create_session_id();
-			self.sessions.insert(session_id.clone(), Session::new(user));
+			self.sessions.insert(session_id.clone(), Session::new(name));
 			Ok(session_id)
 		} else {
 			Err("User already exists.")
 		}
 	}
-	fn update_user(&mut self, user: &str, pass: &str) -> Result<(), &'static str> {
-		if self.created_users.contains_key(user) {
-			self.created_users.insert(user.to_string(), pass.to_string());
-			Ok(())
-		} else if self.deleted_users.contains_key(user) {
-			Err("User not found.")
-		} else if self.updated_users.contains_key(user) {
-			self.updated_users.insert(user.to_string(), pass.to_string());
-			Ok(())
-		} else if cdb::cdb_get(FILE_USERS_CDB, user).is_ok() {
-			self.updated_users.insert(user.to_string(), pass.to_string());
-			Ok(())
-		} else {
-			Err("User not found.")
+	fn update_user(&mut self, name: &str, pass: &str) -> Result<(), &'static str> {
+		if let Some(user) = self.created_users.get_mut(name) {
+			user.password = pass.to_string();
+			user.updated = time::get_time().sec;
+			return Ok(());
 		}
+		if self.updated_users.contains_key(name) {
+			if let Some(user) = self.updated_users.get_mut(name) {
+				if ! user.is_deleted() {
+					user.password = pass.to_string();
+					user.updated = time::get_time().sec;
+					return Ok(());
+				}
+			}
+		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+			let mut user = User::parse(name, s.as_str());
+			if ! user.is_deleted() {
+				user.password = pass.to_string();
+				user.updated = time::get_time().sec;
+				self.updated_users.insert(name.to_string(), user);
+				return Ok(());
+			}
+		}
+		Err("User not found.")
 	}
-	fn delete_user(&mut self, user: &str) -> Result<(), &'static str> {
-		if self.created_users.contains_key(user) {
-			self.created_users.remove(user);
-			Ok(())
-		} else if self.deleted_users.contains_key(user) {
-			Err("User not found.")
-		} else if let Some(pw) = self.updated_users.get(user) {
-			self.deleted_users.insert(user.to_string(), pw.to_string());
-			Ok(())
-		} else if let Ok(pw) = cdb::cdb_get(FILE_USERS_CDB, user) {
-			self.deleted_users.insert(user.to_string(), pw.to_string());
-			Ok(())
-		} else {
-			Err("User not found.")
+	fn delete_user(&mut self, name: &str) -> Result<(), &'static str> {
+		if self.created_users.contains_key(name) {
+			self.created_users.remove(name);
+			return Ok(());
 		}
+		if self.updated_users.contains_key(name) {
+			if let Some(user) = self.updated_users.get_mut(name) {
+				if ! user.is_deleted() {
+					user.deleted = time::get_time().sec;
+					return Ok(());
+				}
+			}
+		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+			let mut user = User::parse(name, s.as_str());
+			if ! user.is_deleted() {
+				user.deleted = time::get_time().sec;
+				self.updated_users.insert(name.to_string(), user);
+				return Ok(());
+			}
+		}
+		Err("User not found.")
 	}
 	fn save(&mut self) -> Result<(), SaveError> {
 		if let Ok(_) = cdb::cdb_export(FILE_USERS_CDB, FILE_USERS_OLD) {
@@ -194,31 +267,21 @@ impl SessionManager {
 			for line in reader.lines() {
 				if let Ok(line) = line {
 					if let Some(pos) = line.find(char::is_whitespace) {
-						let user = &line[..pos];
-						let pass = &line[pos + 1..];
-						if ! self.deleted_users.contains_key(user) {
-							if let Some(pw) = self.updated_users.get(user) {
-								let mut buf = String::from(user);
-								buf.push('\x20');
-								buf.push_str(pw);
-								buf.push('\n');
-								writer.write(buf.as_bytes())?;
-							} else {
-								let mut buf = String::from(user);
-								buf.push('\x20');
-								buf.push_str(pass);
-								buf.push('\n');
-								writer.write(buf.as_bytes())?;
-							}
+						let name = &line[..pos];
+						if let Some(user) = self.updated_users.get(name) {
+							let mut buf = String::from(user.to_string());
+							buf.push('\n');
+							writer.write(buf.as_bytes())?;
+						} else {
+							let mut buf = String::from(line.as_str());
+							buf.push('\n');
+							writer.write(buf.as_bytes())?;
 						}
 					}
 				}
 			}
-			for (user,pass) in self.created_users.iter() {
-				let mut buf = String::new();
-				buf.push_str(user);
-				buf.push('\x20');
-				buf.push_str(pass);
+			for (_, user) in self.created_users.iter() {
+				let mut buf = String::from(user.to_string());
 				buf.push('\n');
 				writer.write(buf.as_bytes())?;
 			}
@@ -227,7 +290,6 @@ impl SessionManager {
 				fs::rename(FILE_USERS_TMP, FILE_USERS_CDB)?;
 				self.created_users.clear();
 				self.updated_users.clear();
-				self.deleted_users.clear();
 				Ok(())
 			} else {
 				Err(SaveError::Msg("Import failed."))
@@ -246,11 +308,11 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 		let mut sp = line.trim().split_whitespace();
 		if let Some(cmd) = sp.next() {
 			if cmd == "LOGIN" {
-				let user = sp.next().unwrap_or("");
+				let name = sp.next().unwrap_or("");
 				let pass = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
 					session_manager.clean();
-					match session_manager.login(user, pass) {
+					match session_manager.login(name, pass) {
 						Ok(session_id) => {
 							writer.write(b"OK ").unwrap();
 							writer.write(session_id.as_bytes()).unwrap();
@@ -269,7 +331,7 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 					match session_manager.is_logged_in(session_id) {
 						Ok(session) => {
 							writer.write(b"OK ").unwrap();
-							writer.write(session.user.as_bytes()).unwrap();
+							writer.write(session.name.as_bytes()).unwrap();
 							writer.write(b"\r\n").unwrap();
 						},
 						Err(error) => {
@@ -285,7 +347,7 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 					match session_manager.logout(session_id) {
 						Ok(session) => {
 							writer.write(b"OK ").unwrap();
-							writer.write(session.user.as_bytes()).unwrap();
+							writer.write(session.name.as_bytes()).unwrap();
 							writer.write(b"\r\n").unwrap();
 						},
 						Err(error) => {
@@ -296,10 +358,10 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 					}
 				}
 			} else if cmd == "CREATE" {
-				let user = sp.next().unwrap_or("");
+				let name = sp.next().unwrap_or("");
 				let pass = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
-					match session_manager.create_user(user, pass) {
+					match session_manager.create_user(name, pass) {
 						Ok(session_id) => {
 							writer.write(b"OK ").unwrap();
 							writer.write(session_id.as_bytes()).unwrap();
@@ -313,10 +375,10 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 					}
 				}
 			} else if cmd == "UPDATE" {
-				let user = sp.next().unwrap_or("");
+				let name = sp.next().unwrap_or("");
 				let pass = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
-					match session_manager.update_user(user, pass) {
+					match session_manager.update_user(name, pass) {
 						Ok(_) => {
 							writer.write(b"OK\r\n").unwrap();
 						},
@@ -328,9 +390,9 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 					}
 				}
 			} else if cmd == "DELETE" {
-				let user = sp.next().unwrap_or("");
+				let name = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
-					match session_manager.delete_user(user) {
+					match session_manager.delete_user(name) {
 						Ok(_) => {
 							writer.write(b"OK\r\n").unwrap();
 						},
