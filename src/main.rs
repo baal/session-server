@@ -14,6 +14,7 @@ use std::io::{BufReader, BufWriter, Error as IoError};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use rand::Rng;
 
@@ -300,7 +301,7 @@ impl SessionManager {
 	}
 }
 
-fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
+fn handler(session_manager: Arc<Mutex<SessionManager>>, stream: UnixStream) {
 	let mut reader = BufReader::new(&stream);
 	let mut writer = BufWriter::new(&stream);
 	let mut line = String::new();
@@ -311,7 +312,6 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 				let name = sp.next().unwrap_or("");
 				let pass = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
-					session_manager.clean();
 					match session_manager.login(name, pass) {
 						Ok(session_id) => {
 							writer.write(b"OK ").unwrap();
@@ -432,13 +432,32 @@ fn handler(session_manager: &Arc<Mutex<SessionManager>>, stream: UnixStream) {
 	}
 }
 
+fn maintenance(session_manager: Arc<Mutex<SessionManager>>) {
+	loop {
+		if let Ok(mut session_manager) = session_manager.lock() {
+			session_manager.clean();
+			if
+				! session_manager.created_users.is_empty() ||
+				! session_manager.updated_users.is_empty()
+			{
+				let _ = session_manager.save();
+			}
+		}
+		thread::sleep(Duration::from_secs(600));
+	}
+}
+
 fn main() {
 	let session_manager = Arc::new(Mutex::new(SessionManager::new()));
+
+	let sm = session_manager.clone();
+	thread::spawn(move || maintenance(sm));
+
 	let listener = UnixListener::bind(FILE_SOCKET).unwrap();
 	for stream in listener.incoming() {
 		if let Ok(stream) = stream {
-			let session_manager = session_manager.clone();
-			thread::spawn(move || handler(&session_manager, stream));
+			let sm = session_manager.clone();
+			thread::spawn(move || handler(sm, stream));
 		}
 	}
 }
