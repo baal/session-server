@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use rand::Rng;
 
+const LOCK_COUNT: u64 = 5;
 const SESSION_PERIOD: i64 = 3600;
-const FILE_SOCKET: &'static str = "/tmp/login.socket";
+const FILE_SOCKET: &'static str = "sessiond.sock";
 const FILE_USERS_CDB: &'static str = "users.cdb";
 const FILE_USERS_OLD: &'static str = "users.old";
 const FILE_USERS_NEW: &'static str = "users.new";
@@ -62,6 +63,9 @@ struct User {
 	updated: i64,
 	deleted: i64,
 	last_loggedin: i64,
+	failed: i64,
+	fail_count: u64,
+	locked: i64,
 }
 
 impl User {
@@ -73,6 +77,9 @@ impl User {
 			updated: 0,
 			deleted: 0,
 			last_loggedin: 0,
+			failed: 0,
+			fail_count: 0,
+			locked: 0,
 		}
 	}
 	fn parse(name: &str, rest: &str) -> User {
@@ -84,6 +91,9 @@ impl User {
 			updated: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
 			deleted: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
 			last_loggedin: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+			failed: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
+			fail_count: parts.next().map_or(0, |s| u64::from_str_radix(s, 10).unwrap_or(0)),
+			locked: parts.next().map_or(0, |s| i64::from_str_radix(s, 10).unwrap_or(0)),
 		}
 	}
 	fn to_string(&self) -> String {
@@ -99,10 +109,19 @@ impl User {
 		buf.push_str(self.deleted.to_string().as_str());
 		buf.push('\x20');
 		buf.push_str(self.last_loggedin.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.failed.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.fail_count.to_string().as_str());
+		buf.push('\x20');
+		buf.push_str(self.locked.to_string().as_str());
 		buf
 	}
 	fn is_deleted(&self) -> bool {
 		self.deleted != 0
+	}
+	fn is_locked(&self) -> bool {
+		self.locked != 0
 	}
 }
 
@@ -158,25 +177,52 @@ impl SessionManager {
 		let mut result = false;
 		if self.created_users.contains_key(name) {
 			if let Some(user) = self.created_users.get_mut(name) {
-				if user.password == pass {
-					user.last_loggedin = time::get_time().sec;
-					result = true;
+				if ! user.is_locked() {
+					if user.password == pass {
+						user.fail_count = 0;
+						user.last_loggedin = time::get_time().sec;
+						result = true;
+					} else {
+						user.failed = time::get_time().sec;
+						user.fail_count += 1;
+						if user.fail_count >= LOCK_COUNT {
+							user.locked = user.failed;
+						}
+					}
 				}
 			}
 		} else if self.updated_users.contains_key(name) {
 			if let Some(user) = self.updated_users.get_mut(name) {
-				if ! user.is_deleted() && user.password == pass {
-					user.last_loggedin = time::get_time().sec;
-					result = true;
+				if ! user.is_locked() && ! user.is_deleted() {
+					if user.password == pass {
+						user.fail_count = 0;
+						user.last_loggedin = time::get_time().sec;
+						result = true;
+					} else {
+						user.failed = time::get_time().sec;
+						user.fail_count += 1;
+						if user.fail_count >= LOCK_COUNT {
+							user.locked = user.failed;
+						}
+					}
 				}
 			}
 		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
 			let mut user = User::parse(name, s.as_str());
-			if ! user.is_deleted() && user.password == pass {
-				user.last_loggedin = time::get_time().sec;
-				self.updated_users.insert(name.to_string(), user);
-				result = true;
+			if ! user.is_locked() && ! user.is_deleted() {
+				if user.password == pass {
+					user.fail_count = 0;
+					user.last_loggedin = time::get_time().sec;
+					result = true;
+				} else {
+					user.failed = time::get_time().sec;
+					user.fail_count += 1;
+					if user.fail_count >= LOCK_COUNT {
+						user.locked = user.failed;
+					}
+				}
 			}
+			self.updated_users.insert(name.to_string(), user);
 		}
 		if result {
 			let session_id = self.create_session_id();

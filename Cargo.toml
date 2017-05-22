@@ -1,5 +1,5 @@
 [package]
-name = "session-server"
+name = "sessiond"
 version = "0.1.0"
 authors = ["baal"]
 
