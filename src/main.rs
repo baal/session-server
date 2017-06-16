@@ -6,12 +6,14 @@ mod cdb;
 
 use std::char;
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
-use std::fs;
 use std::fs::File;
+use std::fs;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Error as IoError};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -144,15 +146,26 @@ impl Session {
 
 struct SessionManager {
 	seqno: u8,
+	dir: String,
+	path_users_cdb: String,
 	sessions: HashMap<String, Session>,
 	created_users: HashMap<String, User>,
 	updated_users: HashMap<String, User>,
 }
 
 impl SessionManager {
-	fn new() -> SessionManager {
+	fn new(dir: String) -> SessionManager {
+		let path = if dir.len() != 0 {
+				let mut path_buf = PathBuf::from(dir.clone());
+				path_buf.push(FILE_USERS_CDB);
+				path_buf.as_path().to_str().unwrap_or(FILE_USERS_CDB).to_string()
+			} else {
+				String::from(FILE_USERS_CDB)
+			};
 		SessionManager {
 			seqno: 0,
+			dir: dir,
+			path_users_cdb: path,
 			sessions: HashMap::new(),
 			created_users: HashMap::new(),
 			updated_users: HashMap::new(),
@@ -172,6 +185,60 @@ impl SessionManager {
 		self.seqno = if self.seqno == u8::max_value() { 0 } else { self.seqno + 1 };
 		bytes[15] = self.seqno;
 		bytes_to_string(&bytes)
+	}
+	fn auth(&mut self, name: &str, pass: &str) -> Result<(), &'static str> {
+		let mut result = false;
+		if self.created_users.contains_key(name) {
+			if let Some(user) = self.created_users.get_mut(name) {
+				if ! user.is_locked() {
+					if user.password == pass {
+						user.fail_count = 0;
+						result = true;
+					} else {
+						user.failed = time::get_time().sec;
+						user.fail_count += 1;
+						if user.fail_count >= LOCK_COUNT {
+							user.locked = user.failed;
+						}
+					}
+				}
+			}
+		} else if self.updated_users.contains_key(name) {
+			if let Some(user) = self.updated_users.get_mut(name) {
+				if ! user.is_locked() && ! user.is_deleted() {
+					if user.password == pass {
+						user.fail_count = 0;
+						result = true;
+					} else {
+						user.failed = time::get_time().sec;
+						user.fail_count += 1;
+						if user.fail_count >= LOCK_COUNT {
+							user.locked = user.failed;
+						}
+					}
+				}
+			}
+		} else if let Ok(s) = cdb::cdb_get(self.path_users_cdb.as_str(), name) {
+			let mut user = User::parse(name, s.as_str());
+			if ! user.is_locked() && ! user.is_deleted() {
+				if user.password == pass {
+					user.fail_count = 0;
+					result = true;
+				} else {
+					user.failed = time::get_time().sec;
+					user.fail_count += 1;
+					if user.fail_count >= LOCK_COUNT {
+						user.locked = user.failed;
+					}
+				}
+			}
+			self.updated_users.insert(name.to_string(), user);
+		}
+		if result {
+			Ok(())
+		} else {
+			Err("Authentication failed.")
+		}
 	}
 	fn login(&mut self, name: &str, pass: &str) -> Result<String, &'static str> {
 		let mut result = false;
@@ -207,7 +274,7 @@ impl SessionManager {
 					}
 				}
 			}
-		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+		} else if let Ok(s) = cdb::cdb_get(self.path_users_cdb.as_str(), name) {
 			let mut user = User::parse(name, s.as_str());
 			if ! user.is_locked() && ! user.is_deleted() {
 				if user.password == pass {
@@ -248,7 +315,7 @@ impl SessionManager {
 		if
 			! self.created_users.contains_key(name) &&
 			! self.updated_users.contains_key(name) &&
-			! cdb::cdb_get(FILE_USERS_CDB, name).is_ok()
+			! cdb::cdb_get(self.path_users_cdb.as_str(), name).is_ok()
 		{
 			self.created_users.insert(name.to_string(), User::new(name, pass));
 			let session_id = self.create_session_id();
@@ -272,7 +339,7 @@ impl SessionManager {
 					return Ok(());
 				}
 			}
-		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+		} else if let Ok(s) = cdb::cdb_get(self.path_users_cdb.as_str(), name) {
 			let mut user = User::parse(name, s.as_str());
 			if ! user.is_deleted() {
 				user.password = pass.to_string();
@@ -295,7 +362,7 @@ impl SessionManager {
 					return Ok(());
 				}
 			}
-		} else if let Ok(s) = cdb::cdb_get(FILE_USERS_CDB, name) {
+		} else if let Ok(s) = cdb::cdb_get(self.path_users_cdb.as_str(), name) {
 			let mut user = User::parse(name, s.as_str());
 			if ! user.is_deleted() {
 				user.deleted = time::get_time().sec;
@@ -306,9 +373,30 @@ impl SessionManager {
 		Err("User not found.")
 	}
 	fn save(&mut self) -> Result<(), SaveError> {
-		if let Ok(_) = cdb::cdb_export(FILE_USERS_CDB, FILE_USERS_OLD) {
-			let of = File::open(FILE_USERS_OLD)?;
-			let nf = File::create(FILE_USERS_NEW)?;
+		let path_users_old = if self.dir.len() != 0 {
+				let mut path_buf = PathBuf::from(self.dir.clone());
+				path_buf.push(FILE_USERS_OLD);
+				path_buf.as_path().to_str().unwrap_or(FILE_USERS_OLD).to_string()
+			} else {
+				String::from(FILE_USERS_OLD)
+			};
+		let path_users_new = if self.dir.len() != 0 {
+				let mut path_buf = PathBuf::from(self.dir.clone());
+				path_buf.push(FILE_USERS_NEW);
+				path_buf.as_path().to_str().unwrap_or(FILE_USERS_NEW).to_string()
+			} else {
+				String::from(FILE_USERS_NEW)
+			};
+		let path_users_tmp = if self.dir.len() != 0 {
+				let mut path_buf = PathBuf::from(self.dir.clone());
+				path_buf.push(FILE_USERS_TMP);
+				path_buf.as_path().to_str().unwrap_or(FILE_USERS_TMP).to_string()
+			} else {
+				String::from(FILE_USERS_TMP)
+			};
+		if let Ok(_) = cdb::cdb_export(self.path_users_cdb.as_str(), path_users_old.as_str()) {
+			let of = File::open(path_users_old.as_str())?;
+			let nf = File::create(path_users_new.as_str())?;
 			let reader = BufReader::new(of);
 			let mut writer = BufWriter::new(nf);
 			for line in reader.lines() {
@@ -333,8 +421,8 @@ impl SessionManager {
 				writer.write(buf.as_bytes())?;
 			}
 			writer.flush()?;
-			if let Ok(_) = cdb::cdb_import(FILE_USERS_TMP, FILE_USERS_NEW) {
-				fs::rename(FILE_USERS_TMP, FILE_USERS_CDB)?;
+			if let Ok(_) = cdb::cdb_import(path_users_tmp.as_str(), path_users_new.as_str()) {
+				fs::rename(path_users_tmp.as_str(), self.path_users_cdb.as_str())?;
 				self.created_users.clear();
 				self.updated_users.clear();
 				Ok(())
@@ -354,7 +442,22 @@ fn handler(session_manager: Arc<Mutex<SessionManager>>, stream: UnixStream) {
 	if let Ok(_) = reader.read_line(&mut line) {
 		let mut sp = line.trim().split_whitespace();
 		if let Some(cmd) = sp.next() {
-			if cmd == "LOGIN" {
+			if cmd == "AUTH" {
+				let name = sp.next().unwrap_or("");
+				let pass = sp.next().unwrap_or("");
+				if let Ok(mut session_manager) = session_manager.lock() {
+					match session_manager.auth(name, pass) {
+						Ok(_) => {
+							writer.write(b"OK\r\n").unwrap();
+						},
+						Err(error) => {
+							writer.write(b"NG ").unwrap();
+							writer.write(error.as_bytes()).unwrap();
+							writer.write(b"\r\n").unwrap();
+						},
+					}
+				}
+			} else if cmd == "LOGIN" {
 				let name = sp.next().unwrap_or("");
 				let pass = sp.next().unwrap_or("");
 				if let Ok(mut session_manager) = session_manager.lock() {
@@ -493,13 +596,43 @@ fn maintenance(session_manager: Arc<Mutex<SessionManager>>) {
 	}
 }
 
+fn get_args() -> (String, String) {
+	let mut path_sock = String::new();
+	let mut dir_user = String::new();
+	let mut flag_path_sock = false;
+	let mut flag_dir_user = false;
+	for arg in env::args() {
+		if flag_path_sock {
+			path_sock = arg;
+			flag_path_sock = false;
+			continue;
+		}
+		if flag_dir_user {
+			dir_user = arg;
+			flag_dir_user = false;
+			continue;
+		}
+		if arg == "-sock" {
+			flag_path_sock = true;
+			continue;
+		}
+		if arg == "-dir" {
+			flag_dir_user = true;
+			continue;
+		}
+	}
+	return (path_sock, dir_user);
+}
+
 fn main() {
-	let session_manager = Arc::new(Mutex::new(SessionManager::new()));
+	let (path, dir) = get_args();
+
+	let session_manager = Arc::new(Mutex::new(SessionManager::new(dir)));
 
 	let sm = session_manager.clone();
 	thread::spawn(move || maintenance(sm));
 
-	let listener = UnixListener::bind(FILE_SOCKET).unwrap();
+	let listener = UnixListener::bind(if path.len() != 0 { path.as_str() } else { FILE_SOCKET }).unwrap();
 	for stream in listener.incoming() {
 		if let Ok(stream) = stream {
 			let sm = session_manager.clone();
